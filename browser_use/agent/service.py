@@ -661,13 +661,25 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			# Phase 1: Prepare context (browser state, action models)
 			browser_state_summary, page_filtered_actions = await self._prepare_context(step_info)
 
+			# Phase 1.6: Wait for previous step's model output (only when needed for state messages)
+			if hasattr(self, '_pending_model_output_task') and self._pending_model_output_task:
+				self.logger.debug(f'⚡ Step {self.state.n_steps}: Waiting for previous step model output for state messages...')
+				self.state.last_model_output = await self._pending_model_output_task
+				
+				# Use the browser state summary from when the model output was generated
+				if hasattr(self, '_pending_browser_state_summary') and self._pending_browser_state_summary:
+					await self._post_process_with_model_output(self._pending_browser_state_summary)
+					self._pending_browser_state_summary = None
+				
+				self._pending_model_output_task = None
+
 			# Phase 2: Create state messages with current state before LLM call
 			self._create_state_messages(browser_state_summary, step_info, page_filtered_actions)
 
 			# Phase 3: Get actions and start parallel execution immediately
-			actions, full_response_task = await self._get_next_action_parallel(browser_state_summary)
+			actions_task, full_response_task = self._get_next_action_parallel(browser_state_summary)
 			
-			# MAXIMAL PARALLELIZATION: Start action execution immediately while response continues
+			actions = await actions_task
 			action_task = asyncio.create_task(self._execute_actions(actions))
 			self.logger.debug(f'⚡ Step {self.state.n_steps}: Actions executing while response completes in background...')
 			
@@ -679,13 +691,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.logger.debug(f'⚡ Step {self.state.n_steps}: Actions complete! Continuing with post-processing while response completes in background...')
 			await self._post_process()
 			
-			# Phase 5: NOW wait for full model output (only when we absolutely need it)
-			self.logger.debug(f'⚡ Step {self.state.n_steps}: Waiting for complete model output...')
-			model_output = await full_response_task
-			self.state.last_model_output = model_output
-			
-			# Phase 6: Final post-processing that requires model output (callbacks, conversation saving)
-			await self._post_process_with_model_output(browser_state_summary)
+			# Phase 5: Store model output task and browser state for next step
+			self.logger.debug(f'⚡ Step {self.state.n_steps}: Storing model output task for next step - continuing immediately!')
+			self._pending_model_output_task = full_response_task
+			self._pending_browser_state_summary = browser_state_summary
 
 		except Exception as e:
 			# Handle ALL exceptions in one place
@@ -756,7 +765,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		
 
 	@observe_debug(ignore_input=True, name='get_next_action_parallel')
-	async def _get_next_action_parallel(self, browser_state_summary: BrowserStateSummary) -> tuple[list[ActionModel], asyncio.Task[AgentOutput]]:
+	def _get_next_action_parallel(self, browser_state_summary: BrowserStateSummary) -> tuple[asyncio.Task[list[ActionModel]], asyncio.Task[AgentOutput]]:
 		"""Get actions and full response, using streaming for Gemini models"""
 		input_messages = self._message_manager.get_messages()
 		self.logger.debug(
@@ -771,24 +780,39 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					# Get streaming generator for true parallel execution
 					stream_generator = self.llm.astream_parallel(input_messages, output_format=self.AgentOutput)
 					
-					# Get the first result (should contain actions)
-					first_result = await stream_generator.__anext__()
-					actions = first_result.completion.action
-					
-					# Create task to get the complete response
-					async def get_full_response():
+					# Create shared streaming consumer that yields both actions and full response
+					async def consume_stream():
+						# Get the first result (should contain actions)
+						first_result = await stream_generator.__anext__()
+						actions = first_result.completion.action
+						
+						# Try to get the second result (complete response)
 						try:
-							# Get the second result (complete response)
 							complete_result = await stream_generator.__anext__()
-							return complete_result.completion
+							full_response = complete_result.completion
 						except StopAsyncIteration:
-							# If no second result, return the first one
-							return first_result.completion
+							# If no second result, use the first one
+							full_response = first_result.completion
+						
+						return actions, full_response
 					
+					# Create the stream consumption task
+					stream_task = asyncio.create_task(consume_stream())
+					
+					# Create separate tasks that extract actions and full response
+					async def get_actions():
+						actions, _ = await stream_task
+						return actions
+					
+					async def get_full_response():
+						_, full_response = await stream_task
+						return full_response
+					
+					actions_task = asyncio.create_task(get_actions())
 					full_response_task = asyncio.create_task(get_full_response())
 					
-					self.logger.debug(f'🚀 Got {len(actions)} actions from parallel streaming, continuing execution...')
-					return actions, full_response_task
+					self.logger.debug(f'🌊 Created streaming tasks - returning immediately without waiting!')
+					return actions_task, full_response_task
 					
 				except Exception as streaming_error:
 					self.logger.warning(f'⚠️ Parallel streaming failed, falling back to standard invoke: {streaming_error}')
@@ -797,17 +821,18 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			# Standard invoke for other models or fallback
 			response = await self.llm.ainvoke(input_messages, output_format=self.AgentOutput)
 
-			# Extract actions from the response
-			actions = response.completion.action
+			# Create tasks for both actions and full response (consistent with streaming)
+			async def get_actions():
+				return response.completion.action
 
-			# Create a completed task for the full response (since we already have it)
 			async def get_full_response():
 				return response.completion
 
+			actions_task = asyncio.create_task(get_actions())
 			full_response_task = asyncio.create_task(get_full_response())
 
-			# Return actions and the task for full response
-			return actions, full_response_task
+			# Return tasks for both actions and full response
+			return actions_task, full_response_task
 			
 		except TimeoutError:
 			@observe(name='_llm_call_timed_out_with_input')
