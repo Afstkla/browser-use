@@ -677,7 +677,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self._create_state_messages(browser_state_summary, step_info, page_filtered_actions)
 
 			# Phase 3: Get actions and start parallel execution immediately
-			actions_task, full_response_task = self._get_next_action_parallel(browser_state_summary)
+			actions_task, full_response_task = await self._get_next_action_parallel(browser_state_summary)
 			
 			actions = await actions_task
 			action_task = asyncio.create_task(self._execute_actions(actions))
@@ -765,7 +765,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		
 
 	@observe_debug(ignore_input=True, name='get_next_action_parallel')
-	def _get_next_action_parallel(self, browser_state_summary: BrowserStateSummary) -> tuple[asyncio.Task[list[ActionModel]], asyncio.Task[AgentOutput]]:
+	async def _get_next_action_parallel(self, browser_state_summary: BrowserStateSummary) -> tuple[asyncio.Task[list[ActionModel]], asyncio.Task[AgentOutput]]:
 		"""Get actions and full response, using streaming for Gemini models"""
 		input_messages = self._message_manager.get_messages()
 		self.logger.debug(
@@ -773,66 +773,46 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		)
 
 		try:
-			# Use parallel streaming for Google models if available
-			if hasattr(self.llm, 'astream_parallel') and 'gemini' in self.llm.model.lower():
-				self.logger.debug('🌊 Using parallel streaming mode')
-				try:
-					# Get streaming generator for true parallel execution
-					stream_generator = self.llm.astream_parallel(input_messages, output_format=self.AgentOutput)
-					
-					# Create shared streaming consumer that yields both actions and full response
-					async def consume_stream():
-						# Get the first result (should contain actions)
-						first_result = await stream_generator.__anext__()
-						actions = first_result.completion.action
-						
-						# Try to get the second result (complete response)
-						try:
-							complete_result = await stream_generator.__anext__()
-							full_response = complete_result.completion
-						except StopAsyncIteration:
-							# If no second result, use the first one
-							full_response = first_result.completion
-						
-						return actions, full_response
-					
-					# Create the stream consumption task
-					stream_task = asyncio.create_task(consume_stream())
-					
-					# Create separate tasks that extract actions and full response
-					async def get_actions():
-						actions, _ = await stream_task
-						return actions
-					
-					async def get_full_response():
-						_, full_response = await stream_task
-						return full_response
-					
-					actions_task = asyncio.create_task(get_actions())
-					full_response_task = asyncio.create_task(get_full_response())
-					
-					self.logger.debug(f'🌊 Created streaming tasks - returning immediately without waiting!')
-					return actions_task, full_response_task
-					
-				except Exception as streaming_error:
-					self.logger.warning(f'⚠️ Parallel streaming failed, falling back to standard invoke: {streaming_error}')
-					# Fall through to standard invoke
+			# Get streaming generator for true parallel execution
+			stream_generator = self.llm.astream_parallel(input_messages, output_format=self.AgentOutput)
 			
-			# Standard invoke for other models or fallback
-			response = await self.llm.ainvoke(input_messages, output_format=self.AgentOutput)
-
-			# Create tasks for both actions and full response (consistent with streaming)
+			# Create shared streaming consumer that yields both actions and full response
+			async def consume_stream():
+				# Get the first result (should contain actions)
+				first_result = await stream_generator.__anext__()
+				actions = first_result.completion.action
+				
+				# Try to get the second result (complete response)
+				try:
+					complete_result = await stream_generator.__anext__()
+					full_response = complete_result.completion
+				except StopAsyncIteration:
+					# If no second result, use the first one
+					full_response = first_result.completion
+				
+				return actions, full_response
+		
+			# Create the stream consumption task
+			stream_task = asyncio.create_task(consume_stream())
+			
+			# Create separate tasks that extract actions and full response
 			async def get_actions():
-				return response.completion.action
-
+				actions, _ = await stream_task
+				return actions
+			
 			async def get_full_response():
-				return response.completion
-
+				_, full_response = await stream_task
+				return full_response
+			
 			actions_task = asyncio.create_task(get_actions())
 			full_response_task = asyncio.create_task(get_full_response())
-
-			# Return tasks for both actions and full response
+		
+			self.logger.debug(f'🌊 Created streaming tasks - returning immediately without waiting!')
 			return actions_task, full_response_task
+		
+		except Exception as streaming_error:
+			self.logger.error(f'⚠️ Parallel streaming failed: {streaming_error}')
+			raise
 			
 		except TimeoutError:
 			@observe(name='_llm_call_timed_out_with_input')
